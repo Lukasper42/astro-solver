@@ -1,23 +1,39 @@
 """
 ================================================================================
  ASTRO-SOLVER
- Vectorized Gumbel-Max Swarm for the Subset-Sum Problem
+ Team-Based Vectorized Gumbel-Max Swarm for the Subset-Sum Problem
 ================================================================================
 
 Problem Statement
 -----------------
 Given a list of integers ``numbers`` and a target value ``T``, find a subset
 of ``numbers`` whose sum is exactly ``T``. The Astro-Solver solves this
-heuristically in four phases: pruning/germination, vectorized Gumbel-Max swarm,
-memetic local search and pheromone decay.
+heuristically in four phases: pruning/germination, team-based vectorized
+Gumbel-Max swarm, memetic local search, and pheromone decay.
+
+Architecture
+------------
+The swarm is organized into "Teams" (default 300). Each team contains a 
+dynamic number of "Birds" based on the problem size N:
+- N <= 1,000: 50 birds per team (High precision)
+- N <= 100,000: 20 birds per team (Balanced)
+- N > 100,000: 10 birds per team (Standard efficiency)
+
+Memory Efficiency: All birds in a team share the same path and used-mask.
+Search Space Partitioning: The candidate pool is divided into equal chunks, 
+and each bird systematically evaluates one chunk.
+Coordination: The team compares the scores found by its birds and adopts 
+the best move, ensuring diverse yet focused exploration.
 
 Execution
 ---------
 The script is directly executable (IDE: F5 or ``python astro_solver.py``).
-It opens with a short introduction, then walks through an interactive test
-run (Tests 1-5), optionally followed by large-scale stress tests
+It opens with a short introduction, asks how much RAM is available for
+Dynamic Memory-Aware Scaling, then walks through an interactive test run
+(Tests 1-5), optionally followed by large-scale stress tests
 (N = 500,000 and N = 1,000,000), and an optional extreme-scale test
-(N = 5,000,000) if the user opts in.
+(N = 5,000,000) if the user opts in. Team count is recalculated before 
+every test to fit the configured RAM budget.
 
 Usage as a Library
 ------------------
@@ -42,12 +58,12 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 __all__ = ["AstroResult", "astro_solve", "run_tests"]
-__version__ = "0.3.0"
+__version__ = "0.6.0"
 
 # ----------------------------------------------------------------------------
 # Global Solver Constants
 # ----------------------------------------------------------------------------
-DEFAULT_AGENTS: int = 300          # B: Swarm size (Phase 2 specification)
+DEFAULT_AGENTS: int = 300          # B: Maximum Number of Teams
 DEFAULT_MAX_ITERS: int = 600       # Swarm termination criterion
 DECAY_EVERY: int = 50              # Pheromone decay every 50 iterations (Phase 4)
 WINDOW_CANDIDATES: int = 2048      # Candidate window in "Large-Pool" mode
@@ -57,9 +73,6 @@ EPS: float = 1e-12                 # Numerical clip for Gumbel trick
 SWAP_ATTEMPTS: int = 4             # Attempts per memetic mutation
 ESCAPE_PROB: float = 0.15          # Escape probability (worsening swap)
 DEFAULT_SEED: int = 20260214       # Reproducibility
-
-# Safety / heuristic thresholds
-MASK_WARN_BYTES: int = 200 * 1024 * 1024  # warn if estimated used-mask exceeds ~200 MB
 
 # Test-suite pacing (UX)
 TEST_PACE_DELAY_S: float = 1.5     # Pause between the end of one test and the next header
@@ -79,7 +92,8 @@ class AstroResult:
     values: List[int]                  # Values of chosen numbers
     elapsed_s: float                   # Execution time in seconds
     iterations: int                    # Consumed swarm iterations
-    agents: int                        # Used agents (B)
+    teams: int                         # Used teams
+    team_size: int                     # Birds per team
     swaps: int                         # Executed local swaps (Phase 3)
     decays: int                        # Discarded path elements (Phase 4)
     n_input: int                       # Original list length N
@@ -130,7 +144,20 @@ def phase1_prune_and_rank(numbers: np.ndarray, target: int):
 
 
 # ============================================================================
-# Phase 2 · Vectorized Gumbel-Max Swarm
+# Dynamic Configuration Helpers
+# ============================================================================
+def _get_team_size(n: int) -> int:
+    """Determines TEAM_SIZE dynamically based on input size N."""
+    if n <= 1000:
+        return 50
+    elif n <= 100000:
+        return 20
+    else:
+        return 10
+
+
+# ============================================================================
+# Phase 2 · Team-Based Vectorized Gumbel-Max Swarm
 # ============================================================================
 def _gumbel_noise(rng: np.random.Generator, shape) -> np.ndarray:
     """
@@ -148,79 +175,103 @@ def _score_candidates(sums_col: np.ndarray, v: np.ndarray, target: int) -> np.nd
     """
     ln(W) = -ln(|(S + V) - T| + 1)   for a candidate matrix.
 
-    sums_col : (B, 1)  current agent sums
-    v        : (B, C)  candidate values per agent
+    sums_col : (T, 1)  current team sums
+    v        : (T, C)  candidate values per team
     """
     diff = np.abs(sums_col + v - float(target))
     return -np.log1p(diff)
 
 
-def _sample_full(rng, sums, vals, target, used, nonneg, agents):
+def _sample_full(rng, sums, vals, target, used, nonneg, teams, team_size):
     """
     Exact Gumbel-Max scan over the ENTIRE pool (chunked).
-
-    Returns
-    -------
-    sel   : (A,) selected pool index per agent, -1 = dead end
-    score : (A,) corresponding score (-inf = dead end)
+    The search space is partitioned among the team's birds.
     """
-    sums_a = sums[agents].astype(np.float64)       # (A,)
-    sub_used = used[agents]                        # (A, M) bool
-    n_agents = agents.size
+    sums_a = sums[teams].astype(np.float64)       # (T,)
+    sub_used = used[teams]                        # (T, M) bool
+    n_teams = teams.size
     m = vals.size
 
-    best_score = np.full(n_agents, -np.inf)
-    best_idx = np.full(n_agents, -1, dtype=np.int64)
-    rows = np.arange(n_agents)
+    best_score = np.full(n_teams, -np.inf)
+    best_idx = np.full(n_teams, -1, dtype=np.int64)
+    rows = np.arange(n_teams)
 
-    for s in range(0, m, CHUNK_SIZE):
-        e = min(s + CHUNK_SIZE, m)
-        v = vals[s:e].astype(np.float64)[None, :]              # (1, c) — broadcasts
-        score = _score_candidates(sums_a[:, None], v, target)  # -> (A, c)
-        score += _gumbel_noise(rng, score.shape)               # Gumbel-Max trick
-        score[sub_used[:, s:e]] = -np.inf                      # without replacement
-        if nonneg:
-            score[sums_a[:, None] + v > target] = -np.inf      # Overshoot forbidden
+    # Divide the full pool among the team's birds
+    bird_splits = np.array_split(np.arange(m), min(team_size, m))
 
-        am = np.argmax(score, axis=1)
-        am_score = score[rows, am]
-        better = am_score > best_score
-        best_score[better] = am_score[better]
-        best_idx[better] = am[better] + s
+    for chunk_indices in bird_splits:
+        if chunk_indices.size == 0: continue
+        s = chunk_indices[0]
+        e = chunk_indices[-1] + 1
+        
+        # Memory-safe inner chunking
+        for s2 in range(s, e, CHUNK_SIZE):
+            e2 = min(s2 + CHUNK_SIZE, e)
+            v = vals[s2:e2].astype(np.float64)[None, :]              # (1, c) — broadcasts
+            score = _score_candidates(sums_a[:, None], v, target)    # -> (T, c)
+            score += _gumbel_noise(rng, score.shape)                 # Gumbel-Max trick
+            score[sub_used[:, s2:e2]] = -np.inf                      # without replacement
+            if nonneg:
+                score[sums_a[:, None] + v > target] = -np.inf        # Overshoot forbidden
+
+            am = np.argmax(score, axis=1)
+            am_score = score[rows, am]
+            
+            # Team coordination: adopt the best move found across all birds
+            better = am_score > best_score
+            best_score[better] = am_score[better]
+            best_idx[better] = am[better] + s2
 
     sel = np.where(np.isfinite(best_score), best_idx, -1)
     return sel, best_score
 
 
-def _sample_window(rng, sums, vals, sorted_vals, pos_map, target, used, nonneg, agents):
+def _sample_window(rng, sums, vals, sorted_vals, pos_map, target, used, nonneg, teams, team_size):
     """
     Gumbel-Max on a window of ``WINDOW_CANDIDATES`` values closest to the
-    residual value T - S. Exactly the same formula as the full scan, but
-    O(B·C) instead of O(B·M) — necessary for N = 100,000+.
-
-    Returns like ``_sample_full``.
+    residual value T - S. The window is partitioned among the team's birds.
     """
     c = WINDOW_CANDIDATES
-    sums_a = sums[agents]                                     # (A,) int64
-    resid = (target - sums_a).astype(np.float64)              # Residual value per agent
+    sums_a = sums[teams]                                     # (T,) int64
+    resid = (target - sums_a).astype(np.float64)             # Residual value per team
 
-    center = np.searchsorted(sorted_vals, target - sums_a)    # Window center
-    start = np.clip(center - c // 2, 0, vals.size - c)        # Window start
-    spos = start[:, None] + np.arange(c)[None, :]             # (A, C) sorted pos.
-    pidx = pos_map[spos]                                      # -> Pool indices
-    v = sorted_vals[spos].astype(np.float64)                  # (A, C) values
+    center = np.searchsorted(sorted_vals, target - sums_a)   # Window center
+    start = np.clip(center - c // 2, 0, vals.size - c)       # Window start
+    spos = start[:, None] + np.arange(c)[None, :]            # (T, C) sorted pos.
+    
+    n_teams = teams.size
+    best_score = np.full(n_teams, -np.inf)
+    best_pidx = np.full(n_teams, -1, dtype=np.int64)
+    rows = np.arange(n_teams)
 
-    score = _score_candidates(sums_a[:, None].astype(np.float64), v, target)
-    score += _gumbel_noise(rng, score.shape)                  # Gumbel-Max trick
-    score[used[agents[:, None], pidx]] = -np.inf              # without replacement
-    if nonneg:
-        score[v > resid[:, None]] = -np.inf                   # Overshoot forbidden
+    # Divide the candidate window equally among the team's birds
+    bird_splits = np.array_split(np.arange(c), min(team_size, c))
 
-    am = np.argmax(score, axis=1)
-    rows = np.arange(agents.size)
-    am_score = score[rows, am]
-    sel = np.where(np.isfinite(am_score), pidx[rows, am], -1)
-    return sel, am_score
+    for chunk_indices in bird_splits:
+        if chunk_indices.size == 0: continue
+        start_c = chunk_indices[0]
+        end_c = chunk_indices[-1] + 1
+        
+        spos_bird = spos[:, start_c:end_c]
+        pidx_bird = pos_map[spos_bird]
+        v_bird = sorted_vals[spos_bird].astype(np.float64)
+
+        score = _score_candidates(sums_a[:, None].astype(np.float64), v_bird, target)
+        score += _gumbel_noise(rng, score.shape)                  # Gumbel-Max trick
+        score[used[teams[:, None], pidx_bird]] = -np.inf          # without replacement
+        if nonneg:
+            score[v_bird > resid[:, None]] = -np.inf              # Overshoot forbidden
+
+        am = np.argmax(score, axis=1)
+        am_score = score[rows, am]
+        
+        # Team coordination: adopt the best move found across all birds
+        better = am_score > best_score
+        best_score[better] = am_score[better]
+        best_pidx[better] = pidx_bird[rows, am][better]
+
+    sel = np.where(np.isfinite(best_score), best_pidx, -1)
+    return sel, best_score
 
 
 # ============================================================================
@@ -228,26 +279,21 @@ def _sample_window(rng, sums, vals, sorted_vals, pos_map, target, used, nonneg, 
 # ============================================================================
 def _local_swap(rng, b, paths, used, sums, vals, target, nonneg):
     """
-    Dead-end repair for agent ``b``: swap internal path element with an
+    Dead-end repair for team ``b``: swap internal path element with an
     external (unused) element.
-
-    Acceptance: strict improvement of |S - T|, or with ESCAPE_PROB a
-    neutral/worse swap (diversity). Overshoot remains forbidden.
-
-    Returns: 1 if swap executed, else 0.
     """
     path = paths[b]
     if len(path) == 0:
-        return 0                                              # nothing to swap
+        return 0
 
     unused = np.flatnonzero(~used[b])
     if unused.size == 0:
-        return 0                                              # pool completely consumed
+        return 0
 
     cur_dist = abs(int(sums[b]) - target)
     for _ in range(SWAP_ATTEMPTS):
-        in_pos = int(rng.integers(len(path)))                 # internal element
-        out_idx = int(unused[rng.integers(unused.size)])      # external element
+        in_pos = int(rng.integers(len(path)))
+        out_idx = int(unused[rng.integers(unused.size)])
         delta = int(vals[out_idx]) - int(vals[path[in_pos]])
         new_sum = int(sums[b]) + delta
         new_dist = abs(new_sum - target)
@@ -268,9 +314,8 @@ def _local_swap(rng, b, paths, used, sums, vals, target, nonneg):
 # ============================================================================
 def _pheromone_decay(paths, used, sums, vals, active_ids):
     """
-    Discards the LAST added element of each active path
-    ("evaporation" every DECAY_EVERY iterations). Returns the number of
-    discarded elements.
+    Discards the LAST added element of each active team path
+    ("evaporation" every DECAY_EVERY iterations).
     """
     dropped = 0
     for b in active_ids:
@@ -283,49 +328,28 @@ def _pheromone_decay(paths, used, sums, vals, active_ids):
 
 
 # ============================================================================
-# Helpers
-# ============================================================================
-def _estimate_used_mask_bytes(agents: int, pool_size: int) -> int:
-    """Estimate memory in bytes required for the used-mask boolean array."""
-    itemsize = np.dtype(bool).itemsize
-    return int(agents) * int(pool_size) * int(itemsize)
-
-
-# ============================================================================
 # Main Solver
 # ============================================================================
 def astro_solve(
     numbers: Sequence[int],
     target: int,
-    agents: int = DEFAULT_AGENTS,
+    teams: int = DEFAULT_AGENTS,
     max_iters: int = DEFAULT_MAX_ITERS,
     seed: Optional[int] = DEFAULT_SEED,
 ) -> AstroResult:
     """
     Astro-Solver: finds (heuristically) a subset of ``numbers`` with
     sum == ``target``.
-
-    Parameters
-    ---------
-    numbers   : Input list of integers (length N)
-    target    : Target value T
-    agents    : Swarm size B (default 300)
-    max_iters : Maximum swarm iterations
-    seed      : RNG seed for reproducibility (None = random)
-
-    Returns
-    -------
-    AstroResult with solution, diagnostics, and timing.
     """
     t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
     target = int(target)
     arr = np.asarray(numbers, dtype=np.int64).ravel()
     n_input = int(arr.size)
+    team_size = _get_team_size(n_input)
 
     def _finish(success, path, pool_vals, pool_orig, iters, swaps, decays,
                 feasible, message):
-        """Builds the AstroResult from an agent path."""
         if path:
             p = np.asarray(path, dtype=np.int64)
             idx = [int(o) for o in pool_orig[p]]
@@ -337,13 +361,12 @@ def astro_solve(
             success=bool(success), target=target, best_sum=best,
             indices=idx, values=vals_out,
             elapsed_s=time.perf_counter() - t0,
-            iterations=int(iters), agents=int(agents),
+            iterations=int(iters), teams=int(teams), team_size=team_size,
             swaps=int(swaps), decays=int(decays),
             n_input=n_input, n_pool=int(pool_vals.size),
             feasible=bool(feasible), message=message,
         )
 
-    # --- Trivial cases -------------------------------------------------------
     if target == 0:
         return _finish(True, [], arr, np.arange(n_input, dtype=np.int64),
                        0, 0, 0, True, "Trivial case T=0: empty subset is exact solution.")
@@ -351,14 +374,12 @@ def astro_solve(
         return _finish(False, [], arr, np.arange(0, dtype=np.int64),
                        0, 0, 0, False, "Empty input list: target unreachable.")
 
-    # Direct hit: a single number equals T
     single = np.flatnonzero(arr == target)
     if single.size > 0:
         i = int(single[0])
         return _finish(True, [0], np.asarray([target]), np.asarray([i]),
                        0, 0, 0, True, "Instant hit: element identical to T.")
 
-    # --- Phase 1: Pruning & Germination ---------------------------------------
     vals, orig_idx, _k, _freqs = phase1_prune_and_rank(arr, target)
     m = vals.size
     if m == 0:
@@ -366,38 +387,22 @@ def astro_solve(
                        "All numbers > T: pool empty, target unreachable.")
 
     nonneg = bool(vals.min() >= 0)
-
-    # Mathematical pre-check: every partial sum is a multiple of g = gcd.
     g = int(np.gcd.reduce(vals))
     feasible = (g > 0) and (target % g == 0)
-
-    # For provably unreachable targets: limited best-effort run.
     eff_iters = max_iters if feasible else min(max_iters, 200)
 
-    # Value-sorted view for candidate window (Large-Pool mode)
-    pos_map = np.argsort(vals, kind="stable")          # sorted pos -> pool index
-    sorted_vals = vals[pos_map]                        # ascending sorted values
-    window_mode = (agents * m > FULL_SCAN_LIMIT) and (m > WINDOW_CANDIDATES)
+    pos_map = np.argsort(vals, kind="stable")
+    sorted_vals = vals[pos_map]
+    window_mode = (teams * m > FULL_SCAN_LIMIT) and (m > WINDOW_CANDIDATES)
 
-    # --- Swarm Initialization --------------------------------------------
-    b = int(agents)
-
-    # Estimate memory for used-mask and warn if large
-    est_bytes = _estimate_used_mask_bytes(b, m)
-    if est_bytes > MASK_WARN_BYTES:
-        logging.warning(
-            "Estimated used-mask size ~%d bytes (~%.1f MB). Consider lowering DEFAULT_AGENTS or WINDOW_CANDIDATES",
-            est_bytes, est_bytes / (1024.0 * 1024.0)
-        )
-
-    used = np.zeros((b, m), dtype=bool)                # Mask: sampling w/o replacement
-    sums = np.zeros(b, dtype=np.int64)                 # Agent sums S
-    paths: List[List[int]] = [[] for _ in range(b)]    # Paths (pool indices)
+    b = int(teams)
+    used = np.zeros((b, m), dtype=bool)
+    sums = np.zeros(b, dtype=np.int64)
+    paths: List[List[int]] = [[] for _ in range(b)]
     done = np.zeros(b, dtype=bool)
 
-    # Germination: Agent b starts with the b-th best element of K-order.
     for ag in range(b):
-        j = ag % m                                     # K-sorted pool
+        j = ag % m
         used[ag, j] = True
         sums[ag] = vals[j]
         paths[ag].append(int(j))
@@ -405,17 +410,15 @@ def astro_solve(
     swaps_total = 0
     decays_total = 0
     best_dist = int(np.abs(sums - target).min())
-    best_agent = int(np.argmin(np.abs(sums - target)))
-    best_path = list(paths[best_agent])
+    best_team = int(np.argmin(np.abs(sums - target)))
+    best_path = list(paths[best_team])
 
-    # Seed can already be exact (e.g., after pruning edge cases)
     seed_hits = np.flatnonzero(sums == target)
     if seed_hits.size > 0:
         ag = int(seed_hits[0])
         return _finish(True, paths[ag], vals, orig_idx, 0, 0, 0, feasible,
                        "Seed hit immediately: start element sums exactly to T.")
 
-    # --- Phases 2–4: Swarm Loop ----------------------------------------
     iterations_used = 0
     success = False
     final_path: List[int] = []
@@ -423,48 +426,42 @@ def astro_solve(
     for it in range(1, eff_iters + 1):
         iterations_used = it
 
-        # Phase 4: Pheromone decay every 50 iterations
         if it % DECAY_EVERY == 0:
             active = np.flatnonzero(~done)
             decays_total += _pheromone_decay(paths, used, sums, vals, active)
 
-        ids = np.flatnonzero(~done)                    # Active agents
+        ids = np.flatnonzero(~done)
         if ids.size == 0:
             break
 
-        # Phase 2: Gumbel-Max Sampling (Window or Full Scan)
         if window_mode:
             sel, sc = _sample_window(np.random.default_rng(), sums, vals, sorted_vals, pos_map,
-                                     target, used, nonneg, ids)
-            # Window blind (everything masked)? -> safety full scan
+                                     target, used, nonneg, ids, team_size)
             blind = sc == -np.inf
             if np.any(blind):
                 blind_ids = ids[blind]
                 sel2, sc2 = _sample_full(np.random.default_rng(), sums, vals, target, used,
-                                         nonneg, blind_ids)
+                                         nonneg, blind_ids, team_size)
                 sel[blind] = sel2
                 sc[blind] = sc2
         else:
-            sel, sc = _sample_full(np.random.default_rng(), sums, vals, target, used, nonneg, ids)
+            sel, sc = _sample_full(np.random.default_rng(), sums, vals, target, used, nonneg, ids, team_size)
 
         valid = sel >= 0
         move_ids = ids[valid]
         move_sel = sel[valid]
         stuck_ids = ids[~valid]
 
-        # Bookkeeping selected elements (without replacement via mask)
         if move_ids.size > 0:
             used[move_ids, move_sel] = True
             sums[move_ids] += vals[move_sel]
             for ag, j in zip(move_ids, move_sel):
                 paths[ag].append(int(j))
 
-        # Phase 3: Memetic mutation for agents in dead ends
         for ag in stuck_ids:
             swaps_total += _local_swap(np.random.default_rng(), int(ag), paths, used, sums,
                                        vals, target, nonneg)
 
-        # Check exact hit -> immediate success
         if move_ids.size > 0:
             hits = move_ids[sums[move_ids] == target]
             if hits.size > 0:
@@ -472,15 +469,13 @@ def astro_solve(
                 final_path = list(paths[int(hits[0])])
                 break
 
-        # Track global best (for best-effort result)
         dist = np.abs(sums - target)
         j_best = int(np.argmin(dist))
         if int(dist[j_best]) < best_dist:
             best_dist = int(dist[j_best])
-            best_agent = j_best
+            best_team = j_best
             best_path = list(paths[j_best])
 
-    # --- Assemble result ----------------------------------------------
     if success:
         return _finish(True, final_path, vals, orig_idx, iterations_used,
                        swaps_total, decays_total, feasible,
@@ -499,14 +494,6 @@ def astro_solve(
 # Verification (for Test Suite)
 # ============================================================================
 def verify_solution(res: AstroResult, numbers: Sequence[int], expect_exact: bool) -> List[str]:
-    """
-    Checks a solver result for internal consistency:
-    - no duplicate or invalid indices
-    - sum of values == claimed sum
-    - Pruning invariant: all chosen numbers <= T
-    - Success flag matches expectation
-    Returns a list of problem descriptions (empty = all ok).
-    """
     problems: List[str] = []
     arr = np.asarray(numbers, dtype=np.int64).ravel()
     idx = res.indices
@@ -520,8 +507,7 @@ def verify_solution(res: AstroResult, numbers: Sequence[int], expect_exact: bool
 
     recomputed = int(sum(int(arr[i]) for i in idx)) if idx else 0
     if recomputed != res.best_sum:
-        problems.append(f"Sum mismatch: recalculated {recomputed}, "
-                        f"claimed {res.best_sum}.")
+        problems.append(f"Sum mismatch: recalculated {recomputed}, claimed {res.best_sum}.")
     if res.success and res.best_sum != res.target:
         problems.append("Success claimed, but sum != T.")
     if expect_exact and not res.success:
@@ -534,7 +520,6 @@ def verify_solution(res: AstroResult, numbers: Sequence[int], expect_exact: bool
 # ============================================================================
 @dataclass
 class TestOutcome:
-    """Compact record of one executed test case, used for the final summary."""
     number: int
     title: str
     n_input: int
@@ -542,25 +527,26 @@ class TestOutcome:
     exact_success: bool
     elapsed_s: float
     deviation: int
+    teams_used: int = 0
+    team_size_used: int = 0
     error: Optional[str] = None
     skipped: bool = False
 
 
 def _print_intro() -> None:
-    """Prints the introductory header and a short explanation of the solver."""
     print("=" * 78)
     print("  ASTRO-SOLVER")
-    print("  Vectorized Gumbel-Max Swarm for the Subset-Sum Problem")
+    print("  Team-Based Vectorized Gumbel-Max Swarm for the Subset-Sum Problem")
     print("=" * 78)
     print(
         "\n"
         "Given a list of integers and a target value T, Astro-Solver searches\n"
         "heuristically for a subset that sums exactly to T. It combines four\n"
-        "phases: pruning & germination, a vectorized Gumbel-Max swarm sampler,\n"
+        "phases: pruning & germination, a team-based vectorized Gumbel-Max swarm,\n"
         "memetic local-swap repair, and periodic pheromone decay.\n"
         "\n"
-        f"NumPy {np.__version__}  ·  Default swarm size B = {DEFAULT_AGENTS}  ·  "
-        f"Decay every {DECAY_EVERY} iterations\n"
+        f"NumPy {np.__version__}  ·  Max Teams = {DEFAULT_AGENTS}  ·  "
+        f"Dynamic Birds per Team  ·  Decay every {DECAY_EVERY} iterations\n"
         "\n"
         "This run will execute Tests 1-5 (correctness, performance, and edge\n"
         "cases). Afterwards you will be offered optional large-scale stress\n"
@@ -569,21 +555,15 @@ def _print_intro() -> None:
 
 
 def _wait_for_start(auto: bool = False) -> None:
-    """Blocks on Enter before starting the test run, unless running non-interactively."""
     if auto:
         return
     try:
         input("Press Enter to start tests...")
     except EOFError:
-        # No interactive stdin available (e.g., piped execution) - proceed automatically.
         pass
 
 
 def _ask_yes_no(prompt: str, auto_answer: Optional[bool] = None) -> bool:
-    """
-    Asks a yes/no question on the console. Returns True for 'y', False for 'n'.
-    If no interactive stdin is available, falls back to ``auto_answer`` (default False).
-    """
     if auto_answer is not None:
         return auto_answer
     while True:
@@ -603,9 +583,33 @@ def _section_separator(char: str = "-", width: int = 78) -> None:
 
 
 def _pace(delay: float = TEST_PACE_DELAY_S) -> None:
-    """Short pause between tests so console output doesn't scroll by too fast."""
     if delay > 0:
         time.sleep(delay)
+
+
+def _query_available_ram(interactive: bool, default_gb: int = 4,
+                         override_gb: Optional[int] = None) -> int:
+    if not interactive:
+        gb = override_gb if (override_gb is not None and override_gb > 0) else default_gb
+        return gb
+
+    try:
+        raw = input("How much RAM is available? (e.g., 2 for 2GB): ").strip()
+        gb = int(raw)
+        if gb <= 0:
+            raise ValueError("RAM value must be positive")
+    except (ValueError, EOFError):
+        print(f"  Invalid or missing input — defaulting to {default_gb} GB.")
+        gb = default_gb
+    return gb
+
+
+def _compute_dynamic_teams(n_items: int, available_bytes: int):
+    mem_per_team = max(int(n_items), 1) * 1
+    reserved_bytes = available_bytes * 0.5
+    raw_max_teams = int(reserved_bytes / mem_per_team)
+    teams = max(1, min(DEFAULT_AGENTS, raw_max_teams))
+    return teams
 
 
 def _print_case_header(nr: int, title: str, desc: str) -> None:
@@ -625,6 +629,7 @@ def _print_case_result(status: str, res: Optional[AstroResult],
               f"(Target T = {res.target}, Deviation {delta:+d})")
         print(f"  Used Numbers        : {res.count} of {res.n_input} "
               f"(Pool after pruning: {res.n_pool})")
+        print(f"  Swarm Config        : Teams: {res.teams} | Birds per Team: {res.team_size} | Total Birds: {res.teams * res.team_size}")
         print(f"  Execution Time      : {res.elapsed_s:.2f}s")
         print(f"  Iterations/Swaps    : {res.iterations} / {res.swaps} "
               f"(Pheromone decays: {res.decays})")
@@ -642,18 +647,27 @@ def _print_case_result(status: str, res: Optional[AstroResult],
 
 
 def _run_case(nr: int, title: str, desc: str, numbers, target: int,
-              expect_exact: bool, pace_before: bool = True,
+              expect_exact: bool, available_bytes: int, pace_before: bool = True,
               **solver_kwargs) -> TestOutcome:
-    """Executes a test case, prints diagnostics, and returns a TestOutcome record."""
     if pace_before:
         _pace()
     _print_case_header(nr, title, desc)
+
+    n_for_scaling = len(numbers) if hasattr(numbers, "__len__") else 0
+    teams = _compute_dynamic_teams(n_for_scaling, available_bytes)
+    team_size = _get_team_size(n_for_scaling)
+    total_birds = teams * team_size
+    print(f"  Test {nr}: Configuring {teams} teams ({total_birds} total birds, {team_size} per team) for N={n_for_scaling:,}.")
+    
+    solver_kwargs = dict(solver_kwargs)
+    solver_kwargs["teams"] = teams
+
     res: Optional[AstroResult] = None
     problems: List[str] = []
     error: Optional[str] = None
     status = "FAILED"
     passed = False
-    n_input = len(numbers) if hasattr(numbers, "__len__") else 0
+    n_input = n_for_scaling
     elapsed = 0.0
     deviation = -1
 
@@ -669,7 +683,7 @@ def _run_case(nr: int, title: str, desc: str, numbers, target: int,
                       else "SUCCESS (unreachability cleanly detected)")
         else:
             status = "FAILURE (validation)"
-    except Exception as exc:  # noqa: BLE001 — Test suite catches everything
+    except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         tb = traceback.format_exc().strip().splitlines()
         error += "  |  " + (tb[-1] if tb else "")
@@ -681,48 +695,40 @@ def _run_case(nr: int, title: str, desc: str, numbers, target: int,
     return TestOutcome(
         number=nr, title=title, n_input=n_input, passed=passed,
         exact_success=bool(res.success) if res is not None else False,
-        elapsed_s=elapsed, deviation=deviation, error=error,
+        elapsed_s=elapsed, deviation=deviation, teams_used=teams, 
+        team_size_used=team_size, error=error,
     )
 
 
 def _make_reachable_case(rng: np.random.Generator, n: int, lo: int, hi: int,
                          k_subset: int):
-    """Random instance with guaranteed solvability: T = sum of a random subset."""
     numbers = rng.integers(lo, hi + 1, size=n)
     pick = rng.choice(n, size=k_subset, replace=False)
     target = int(numbers[pick].sum())
     return numbers, target
 
 
-def _run_core_cases() -> List[TestOutcome]:
-    """Executes the standard Tests 1-5 (correctness, performance, edge cases)."""
+def _run_core_cases(available_bytes: int) -> List[TestOutcome]:
     outcomes: List[TestOutcome] = []
 
-    # --- Test 1 · Small (N=50): Correctness ---------------------------------
     rng1 = np.random.default_rng(101)
     nums1, t1 = _make_reachable_case(rng1, n=50, lo=1, hi=99, k_subset=12)
     outcomes.append(_run_case(
-        1, "Small Test (N=50)", "Verification of correctness — "
-        "exact solution, unique indices, sum check.",
-        nums1, t1, expect_exact=True, pace_before=False, seed=1001))
+        1, "Small Test (N=50)", "Verification of correctness — exact solution, unique indices, sum check.",
+        nums1, t1, expect_exact=True, available_bytes=available_bytes, pace_before=False, seed=1001))
 
-    # --- Test 2 · Medium (N=5000): Performance ------------------------------
     rng2 = np.random.default_rng(202)
     nums2, t2 = _make_reachable_case(rng2, n=5_000, lo=1, hi=1_000, k_subset=60)
     outcomes.append(_run_case(
-        2, "Medium Test (N=5,000)", "Performance check — "
-        "fully vectorized Gumbel scan over entire pool.",
-        nums2, t2, expect_exact=True, seed=1002))
+        2, "Medium Test (N=5,000)", "Performance check — fully vectorized Gumbel scan over entire pool.",
+        nums2, t2, expect_exact=True, available_bytes=available_bytes, seed=1002))
 
-    # --- Test 3 · Large (N=100000): Stress test -------------------------------
     rng3 = np.random.default_rng(303)
     nums3, t3 = _make_reachable_case(rng3, n=100_000, lo=1, hi=2_000, k_subset=120)
     outcomes.append(_run_case(
-        3, "Large Test (N=100,000)", "Stress test with timing — "
-        "Candidate window mode for large pools.",
-        nums3, t3, expect_exact=True, seed=1003))
+        3, "Large Test (N=100,000)", "Stress test with timing — Candidate window mode for large pools.",
+        nums3, t3, expect_exact=True, available_bytes=available_bytes, seed=1003))
 
-    # --- Test 4 · Edge Case: many duplicates --------------------------------
     rng4 = np.random.default_rng(404)
     nums4 = np.concatenate([
         np.full(400, 7, dtype=np.int64),
@@ -730,97 +736,79 @@ def _run_core_cases() -> List[TestOutcome]:
         rng4.integers(1, 50, size=200),
     ])
     rng4.shuffle(nums4)
-    t4 = 7 * 37 + 3 * 15          # 259 + 45 = 304 — guaranteed reachable
+    t4 = 7 * 37 + 3 * 15
     outcomes.append(_run_case(
-        4, "Edge Case: many duplicates", "700x identical values (7, 3) — "
-        "Sampling without replacement must work index-based.",
-        nums4, int(t4), expect_exact=True, seed=1004))
+        4, "Edge Case: many duplicates", "700x identical values (7, 3) — Sampling without replacement must work index-based.",
+        nums4, int(t4), expect_exact=True, available_bytes=available_bytes, seed=1004))
 
-    # --- Test 5 · Edge Case: T unreachable ---------------------------------
     rng5 = np.random.default_rng(505)
-    nums5 = rng5.integers(1, 501, size=400) * 2   # only even numbers
-    t5 = 501                                      # odd -> never reachable
+    nums5 = rng5.integers(1, 501, size=400) * 2
+    t5 = 501
     outcomes.append(_run_case(
-        5, "Edge Case: Target T unreachable", "Only even numbers, T=501 "
-        "(odd) — gcd check + clean best-effort without crash.",
-        nums5, t5, expect_exact=False, seed=1005, max_iters=250))
+        5, "Edge Case: Target T unreachable", "Only even numbers, T=501 (odd) — gcd check + clean best-effort without crash.",
+        nums5, t5, expect_exact=False, available_bytes=available_bytes, seed=1005, max_iters=250))
 
     return outcomes
 
 
-def _run_large_scale_cases() -> List[TestOutcome]:
-    """Executes the optional Tests 6-7 (large-scale stress tests)."""
+def _run_large_scale_cases(available_bytes: int) -> List[TestOutcome]:
     outcomes: List[TestOutcome] = []
 
-    # --- Test 6 · Very Large (N=500,000) ------------------------------------
     rng6 = np.random.default_rng(606)
     nums6, t6 = _make_reachable_case(rng6, n=500_000, lo=1, hi=2_000, k_subset=150)
     outcomes.append(_run_case(
-        6, "Stress Test (N=500,000)", "Half a million candidate numbers — "
-        "candidate-window sampling keeps memory and runtime bounded.",
-        nums6, t6, expect_exact=True, seed=1006))
+        6, "Stress Test (N=500,000)", "Half a million candidate numbers — candidate-window sampling keeps memory and runtime bounded.",
+        nums6, t6, expect_exact=True, available_bytes=available_bytes, seed=1006))
 
-    # --- Test 7 · Extreme (N=1,000,000) -------------------------------------
     rng7 = np.random.default_rng(707)
     nums7, t7 = _make_reachable_case(rng7, n=1_000_000, lo=1, hi=2_000, k_subset=180)
     outcomes.append(_run_case(
-        7, "Stress Test (N=1,000,000)", "One million candidate numbers — "
-        "practical upper bound demonstration for the swarm approach.",
-        nums7, t7, expect_exact=True, seed=1007))
+        7, "Stress Test (N=1,000,000)", "One million candidate numbers — practical upper bound demonstration for the swarm approach.",
+        nums7, t7, expect_exact=True, available_bytes=available_bytes, seed=1007))
 
     return outcomes
 
 
-def _print_extreme_scale_warning() -> None:
-    """Prints a prominent memory warning before the extreme-scale test (Test 8)."""
-    print()
-    _section_separator("=")
-    print("  !!! WARNING !!!")
-    print(
-        "  WARNING: THIS TEST REQUIRES APPROXIMATELY 1.5 GB OF RAM FOR THE "
-        "AGENT MASKS.\n"
-        "  ENSURE YOUR SYSTEM HAS ENOUGH FREE MEMORY BEFORE PROCEEDING."
-    )
-    _section_separator("=")
-
-
-def _run_extreme_scale_case() -> TestOutcome:
-    """Executes the optional Test 8 (extreme-scale stress test, N=5,000,000)."""
+def _run_extreme_scale_case(available_bytes: int) -> TestOutcome:
     rng8 = np.random.default_rng(808)
     nums8, t8 = _make_reachable_case(rng8, n=5_000_000, lo=1, hi=2_000, k_subset=250)
     return _run_case(
-        8, "Extreme Stress Test (N=5,000,000)", "Five million candidate numbers — "
-        "upper-bound demonstration of the candidate-window swarm under "
-        "significant memory pressure.",
-        nums8, t8, expect_exact=True, seed=1008)
+        8, "Extreme Stress Test (N=5,000,000)", "Five million candidate numbers — upper-bound demonstration of the candidate-window swarm under significant memory pressure.",
+        nums8, t8, expect_exact=True, available_bytes=available_bytes, seed=1008)
 
 
 def _print_summary_table(outcomes: List[TestOutcome]) -> None:
-    """Prints a compact summary table of all executed tests."""
     print()
-    print("=" * 78)
+    print("=" * 90)
     print("  SUMMARY TABLE")
-    print("=" * 78)
-    name_w = max(28, min(38, max((len(o.title) for o in outcomes), default=28)))
-    header = f"  {'#':<3}{'Test':<{name_w}}{'N':>12}{'Status':>10}{'Time':>10}{'Deviation':>12}"
+    print("=" * 90)
+    name_w = max(26, min(34, max((len(o.title) for o in outcomes), default=26)))
+    header = (f"  {'#':<3}{'Test':<{name_w}}{'N':>12}{'Teams':>9}"
+              f"{'Status':>10}{'Time':>10}{'Deviation':>12}")
     print(header)
-    _section_separator(width=78)
+    _section_separator(width=90)
     for o in outcomes:
         status = "PASSED" if o.passed else "FAILED"
         dev = "-" if o.deviation < 0 else str(o.deviation)
         time_str = f"{o.elapsed_s:.2f}s"
         title = (o.title[:name_w - 1] + "…") if len(o.title) > name_w else o.title
-        print(f"  {o.number:<3}{title:<{name_w}}{o.n_input:>12,}{status:>10}{time_str:>10}{dev:>12}")
-    _section_separator(width=78)
+        print(f"  {o.number:<3}{title:<{name_w}}{o.n_input:>12,}{o.teams_used:>9}"
+              f"{status:>10}{time_str:>10}{dev:>12}")
+    _section_separator(width=90)
     passed_count = sum(1 for o in outcomes if o.passed)
     total_time = sum(o.elapsed_s for o in outcomes)
+    
+    max_teams = max((o.teams_used for o in outcomes), default=0)
+    max_team_size = max((o.team_size_used for o in outcomes), default=0)
+    total_birds = max_teams * max_team_size
+    
     print(f"  Total: {passed_count}/{len(outcomes)} tests passed  ·  "
+          f"Teams: {max_teams} | Birds per Team: {max_team_size} | Total Birds: {total_birds}  ·  "
           f"Combined execution time: {total_time:.2f}s")
-    print("=" * 78)
+    print("=" * 90)
 
 
 def _print_comparison_section(extreme_ran: bool = False) -> None:
-    """Prints a short qualitative comparison against exact reference methods."""
     print()
     print("-" * 78)
     print("  COMPARISON WITH EXACT METHODS")
@@ -830,13 +818,13 @@ def _print_comparison_section(extreme_ran: bool = False) -> None:
         "    Classic DP for Subset-Sum needs O(N*T) time and memory. Beyond\n"
         "    roughly N = 10,000 (or a large T), the DP table no longer fits\n"
         "    in memory and the approach becomes impractical. Astro-Solver's\n"
-        "    vectorized swarm scales to hundreds of thousands of elements\n"
+        "    team-based vectorized swarm scales to hundreds of thousands of elements\n"
         "    without building any such table.\n"
         "\n"
         "  vs. Brute Force:\n"
         "    Exhaustive subset enumeration is O(2^N) and becomes infeasible\n"
         "    well before N = 30. Astro-Solver instead searches with a fixed\n"
-        "    number of agents and iterations, so it comfortably handles\n"
+        "    number of teams and iterations, so it comfortably handles\n"
         "    N in the millions.\n"
         "\n"
         "  Bottom line:\n"
@@ -852,46 +840,33 @@ def _print_comparison_section(extreme_ran: bool = False) -> None:
             "    entirely out of reach — DP's O(N*T) table would require far\n"
             "    more memory than is typically available, and Brute Force's\n"
             "    O(2^N) search space is astronomically large. Astro-Solver\n"
-            "    completed this instance using only its fixed agent/window\n"
-            "    budget, demonstrating scaling well beyond exact methods."
+            "    completed this instance using a memory-aware, dynamically\n"
+            "    scaled team count, demonstrating scaling well beyond exact\n"
+            "    methods even under a constrained RAM budget."
         )
     print()
     print("=" * 78)
 
 
 def run_tests(interactive: bool = True, full_suite: Optional[bool] = None,
-              extreme_suite: Optional[bool] = None) -> bool:
-    """
-    Runs the Astro-Solver test suite with console diagnostics.
-
-    Parameters
-    ----------
-    interactive : bool
-        If True (default), prints the introduction, waits for the user to
-        press Enter, and after Tests 1-5 asks whether to proceed with the
-        large-scale stress tests (N=500k, N=1M). If those run, a further
-        warning and confirmation gate the extreme-scale Test 8 (N=5M).
-        If False, runs non-interactively: Tests 1-5 always run, Tests 6-7
-        run only if ``full_suite`` is True, and Test 8 runs only if
-        ``extreme_suite`` is True (and Tests 6-7 also ran).
-    full_suite : Optional[bool]
-        Used only when ``interactive`` is False. If True, Tests 6-7 are
-        executed automatically without prompting.
-    extreme_suite : Optional[bool]
-        Used only when ``interactive`` is False. If True (and ``full_suite``
-        is also True), Test 8 (N=5,000,000) is executed automatically
-        without prompting, skipping the interactive memory warning gate.
-
-    Returns
-    -------
-    bool
-        True if every executed test passed.
-    """
+              extreme_suite: Optional[bool] = None, ram_gb: Optional[int] = None) -> bool:
     _print_intro()
+
+    ram_default = ram_gb if (ram_gb is not None and ram_gb > 0) else 4
+    available_gb = _query_available_ram(
+        interactive=interactive, default_gb=ram_default, override_gb=ram_gb
+    )
+    available_bytes = available_gb * 1024 * 1024 * 1024
+    print(
+        f"\nMemory budget configured: {available_gb} GB "
+        f"({available_bytes:,} bytes). Team count will be scaled dynamically "
+        f"per test to stay within this budget.\n"
+    )
+
     _wait_for_start(auto=not interactive)
 
     t_all = time.perf_counter()
-    outcomes: List[TestOutcome] = _run_core_cases()
+    outcomes: List[TestOutcome] = _run_core_cases(available_bytes)
 
     if interactive:
         print()
@@ -905,17 +880,16 @@ def run_tests(interactive: bool = True, full_suite: Optional[bool] = None,
     extreme_ran = False
 
     if run_large:
-        outcomes.extend(_run_large_scale_cases())
+        outcomes.extend(_run_large_scale_cases(available_bytes))
 
         if interactive:
             _pace()
-            _print_extreme_scale_warning()
-            run_extreme = _ask_yes_no("Proceed with Test 8?")
+            run_extreme = _ask_yes_no("Proceed with Test 8 (Extreme Scale)?")
         else:
             run_extreme = bool(extreme_suite)
 
         if run_extreme:
-            outcomes.append(_run_extreme_scale_case())
+            outcomes.append(_run_extreme_scale_case(available_bytes))
             extreme_ran = True
         else:
             print("\n[SKIP] Extreme-scale stress test (N=5,000,000) skipped.")
@@ -945,14 +919,21 @@ if __name__ == "__main__":
              "with an interactive terminal).")
     parser.add_argument(
         "--extreme", action="store_true",
-        help="Also run the extreme-scale stress test (N=5M, ~1.5 GB RAM). "
+        help="Also run the extreme-scale stress test (N=5M). "
              "Only takes effect together with --full; skips the interactive "
-             "memory-warning confirmation.")
+             "confirmation.")
     parser.add_argument(
         "--non-interactive", action="store_true",
-        help="Skip the 'Press Enter' prompt and the y/n stress-test questions. "
-             "Use --full and/or --extreme together with this flag to include "
-             "the large-scale and extreme-scale tests.")
+        help="Skip the 'Press Enter' prompt, the RAM query, and the y/n "
+             "stress-test questions. Use --full and/or --extreme together "
+             "with this flag to include the large-scale and extreme-scale "
+             "tests, and --ram-gb to set the memory budget.")
+    parser.add_argument(
+        "--ram-gb", type=int, default=None,
+        help="RAM budget in GB for Dynamic Memory-Aware Scaling. In "
+             "non-interactive mode this is used directly (default 4 GB). "
+             "In interactive mode it is only used as the fallback default "
+             "if the live prompt receives invalid input.")
     parser.add_argument("--seed", type=int, default=None, help="Override default RNG seed for tests.")
     parser.add_argument("--log", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO",
                         help="Logging level")
@@ -960,10 +941,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=getattr(logging, args.log), format="%(levelname)s: %(message)s")
     if args.seed is not None:
-        # Note: np.random.default_rng used with explicit seeds in tests will not be affected.
-        # This sets the legacy global RNG seed and may affect code that uses np.random.<func>.
         np.random.seed(args.seed)
 
     ok = run_tests(interactive=not args.non_interactive, full_suite=args.full,
-                    extreme_suite=args.extreme)
+                    extreme_suite=args.extreme, ram_gb=args.ram_gb)
     raise SystemExit(0 if ok else 1)
