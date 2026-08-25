@@ -31,6 +31,20 @@ Tests were executed on a standard consumer CPU using NumPy vectorization. The so
 
 *Note: At N=5,000,000, classical Dynamic Programming would require terabytes of memory and crash immediately. Astro-Solver maintains performance through its sliding-window optimization.*
 
+### Why Astro-Solver? The Scaling Advantage
+
+While classic algorithms like **Bitset-DP** are incredibly fast for small target values ($T$), they suffer from a critical limitation: their memory usage scales with $T$ ($O(T)$). 
+
+| Feature | Bitset-DP / Classic DP | Astro-Solver |
+| :--- | :--- | :--- |
+| **Memory Usage** | Scales with Target $T$ (Can be Terabytes) | Scales with Input Count $N$ (~1.5GB for 5M items) |
+| **Large Targets** | Fails/Crashes if $T$ is large | Handles billions effortlessly |
+| **No Solution?** | Must scan entire range to confirm | Returns "Best Offer" (Closest Sum) immediately |
+| **Hardware** | Needs massive RAM for large $T$ | Runs on consumer laptops |
+
+**Astro-Solver is designed for the "Real World":**
+In logistics, finance, or resource allocation, target values ($T$) are often in the millions or billions. Where Bitset-DP would require impossible amounts of memory, Astro-Solver remains stable and fast by using a **vectorized swarm heuristic** that ignores the magnitude of $T$.
+
 ## Installation
 
 Requires Python 3.8+ and NumPy.
